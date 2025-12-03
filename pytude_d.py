@@ -1,97 +1,128 @@
-import os
-import uuid
-import requests
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
-import yt_dlp
 import re
+import requests
+from yt_dlp import YoutubeDL
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 
-HF_API_URL = "https://rockingyash-speechtotext.hf.space/transcribe/"
+# --- 1. Define Custom Exceptions ---
+class VideoIdError(Exception):
+    """Raised when the Video ID cannot be extracted from the URL."""
+    pass
 
-def extract_video_id(youtube_url):
-    # Regular expression for extracting the video ID
-    pattern = (
-        r'(?:https?:\/\/)?(?:www\.)?'
-        r'(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|\S*?[?&]v=)|'
-        r'youtu\.be\/)'
-        r'([a-zA-Z0-9_-]{11})'
-    )
-    match = re.search(pattern, youtube_url)
-    if match:
-        return match.group(1)  # The video ID is in the first capture group
-    return None
+class VideoTitleError(Exception):
+    """Raised when the Video Title cannot be retrieved via API."""
+    pass
+
+class VideoTranscriptError(Exception):
+    """Raised when the Transcript cannot be retrieved."""
+    pass
+
+# --- 2. Refactored Class ---
+class video_info:
+    def __init__(self, video_url: str):
+        self.video_url = video_url
+        
+     
+        self.video_id = self.extract_video_id()
+        
+        self.title = self.get_video_title()
+        
+
+        self.transcript = self.get_transcript()
+
+        self.current_thumbnail=self.get_current_thumbnail()
+
+    def extract_video_id(self) -> str:
+        patterns = [
+            r'(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([^&\n?#]+)',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, self.video_url)
+            if match:
+                return match.group(1)
+        
+        # FAILED: Raise Exception 1
+        raise VideoIdError("Could not extract a valid YouTube ID from the URL.")
 
 
-def get_youtube_transcript(video_url):
-    try:
-        video_id = extract_video_id(video_url)
-        if not video_id:
-            return None, "Invalid YouTube URL"
-        transcript = YouTubeTranscriptApi.get_transcript(video_id)
-        text = " ".join([line['text'] for line in transcript])
-        return text, None
-    except (TranscriptsDisabled, NoTranscriptFound) as e:
-        return None, f"No transcript: {str(e)}"
-    except Exception as e:
-        return None, f"Transcript API error: {str(e)}"
 
-def download_audio_file(video_url, download_dir="downloads"):
-    os.makedirs(download_dir, exist_ok=True)
-    filename = os.path.join(download_dir, f"{uuid.uuid4().hex}.%(ext)s")
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': filename,
-        'quiet': True,
-        'noplaylist': True,
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=True)
-            downloaded_path = ydl.prepare_filename(info)
-            return downloaded_path, None
-    except Exception as e:
-        return None, f"Download error: {e}"
-
-def transcribe_with_api(file_path):
-    try:
-        with open(file_path, 'rb') as f:
-            response = requests.post(HF_API_URL, files={"file": f})
-        if response.status_code == 200:
-            return response.json().get("transcription"), None
-        else:
-            return None, f"API Error {response.status_code}: {response.text}"
-    except Exception as e:
-        return None, f"Request error: {str(e)}"
-    finally:
+    def get_video_title(self) -> str:
         try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-        except Exception as cleanup_err:
-            print(f"Cleanup error: {cleanup_err}")
+            ydl_opts = {
+                'quiet': True,           # Suppress console output
+                'skip_download': True,   # We only want metadata
+                'no_warnings': True,
+            }
+            
+            with YoutubeDL(ydl_opts) as ydl:
+                # download=False ensures we just fetch JSON info
+                info_dict = ydl.extract_info(self.video_url, download=False)
+                
+                title = info_dict.get('title', None)
+                if not title:
+                    raise Exception("Title field missing in metadata")
+                
+                return title
 
-def full_transcription_pipeline(video_url):
-    print("🔍 Trying YouTube transcript...")
-    transcript, err = get_youtube_transcript(video_url)
-    if transcript:
-        print("✅ Got YouTube transcript!")
-        return transcript
+        except Exception as e:
+            # Passes the error to your custom exception handler
+            raise VideoTitleError(f"Failed to retrieve title via yt-dlp: {str(e)}")
+        
+    
 
-    print(f"❌ {err} — Falling back to Whisper transcription...")
+    def get_current_thumbnail(self) -> str:
+        resolutions = [
+            'maxresdefault',  # 1080p
+            'sddefault',      # 640p
+            'hqdefault',      # 480p
+            'mqdefault',      # 320p
+            'default'         # 120p
+        ] 
+        for resolution in resolutions:
+            url = f'https://img.youtube.com/vi/{self.video_id}/{resolution}.jpg'
+            response = requests.get(url)
+            if response.status_code == 200:
+                return url
+        return None
+    
 
-    file_path, download_err = download_audio_file(video_url)
-    if not file_path:
-        return f"Download failed: {download_err}"
+    def get_transcript(self) -> str:
+        try:
+            ytt_api = YouTubeTranscriptApi()
+            transcript_list = ytt_api.list(self.video_id)    
 
-    print("🎙️ Sending audio to Whisper API...")
-    transcription, api_err = transcribe_with_api(file_path)
-    if transcription:
-        print("✅ Transcription complete!")
-        return transcription
-    else:
-        return f"Whisper API failed: {api_err}"
+            # 1. Try Manual English
+            try:
+                manual_en = transcript_list.find_manually_created_transcript(['en'])
+                data = manual_en.fetch()
+                return " ".join(entry.text for entry in data)
+            except NoTranscriptFound:
+                pass
 
-# 🎬 Example usage
-if __name__ == "__main__":
-    yt_url = input("Enter YouTube URL: ")
-    result = full_transcription_pipeline(yt_url)
-    print("\n--- Final Transcript ---\n")
-    print(result)
+            # 2. Try Auto-generated English
+            try:
+                auto_en = transcript_list.find_generated_transcript(['en'])
+                data = auto_en.fetch()
+                return " ".join(entry.text for entry in data)
+            except NoTranscriptFound:
+                pass
+
+            # 3. Try Translating any available transcript to English
+            for transcript in transcript_list:
+                if transcript.is_translatable:
+                    try:
+                        translated = transcript.translate('en')
+                        data = translated.fetch()
+                        return " ".join(entry.text for entry in data)
+                    except Exception:
+                        continue
+            
+            # If we reach here, we found transcripts object but couldn't get English text
+            raise VideoTranscriptError("No English transcript (manual, auto, or translated) could be generated.")
+
+        except (VideoTranscriptError):
+            # Re-raise our custom error if we triggered it above
+            raise
+        except Exception as e:
+            # Catch all library errors (TranscriptsDisabled, VideoUnavailable, etc.)
+            # FAILED: Raise Exception 3
+            raise VideoTranscriptError(f"Transcript unavailable: {str(e)}")

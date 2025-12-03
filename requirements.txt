@@ -9,8 +9,6 @@ gunicorn
 python-dotenv
 
 # Video/audio downloading and processing
-pytube3
-yt-dlp
 pillow
 youtube-transcript-api
 cloudinary
@@ -18,3 +16,4 @@ cloudinary
 requests
 gradio-client
 google-generativeai
+yt-dlp

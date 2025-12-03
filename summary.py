@@ -1,102 +1,183 @@
 import os
-import google.generativeai as palm
-from generate_image import generate_image
-from new_summary import generate_newsummary
+import google.generativeai as genai
 from dotenv import load_dotenv
-from pytude_d import get_youtube_transcript
-import yt_dlp
+
+# Assuming these are your local modules
+# REMOVED: from new_summary import generate_newsummary (Using local function instead)
+from generate_image import generate_image
+from pytude_d import video_info, VideoIdError, VideoTitleError, VideoTranscriptError
+
+# Load environment variables
 load_dotenv()
 
 api_key = os.getenv("GEMINI_API_KEY")
 if not api_key:
     raise ValueError("GEMINI_API_KEY environment variable not set. Please add it to your .env file.")
 
-def get_video_title(video_url):
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': True,
-    }
+# Configure the Gemini API
+genai.configure(api_key=api_key)
+
+def summarize_text(text):
+    """
+    Uses Gemini to summarize text.
+    Optimized for 'gemini-1.5-flash' for speed and large context (1M tokens).
+    """
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=False)
-            return info.get('title', '')
-    except Exception as e:
-        print(f"Error getting video title: {e}")
-        return None
-
-def process_video_from_url(video_url):
-    subtitle = get_youtube_transcript(video_url)
-    if not subtitle:
-        return None, None
-    
-    title = get_video_title(video_url)
-    
-    prompt = f"""
-        Provide a very short summary, no more than three sentences, for the following video {video_url} subtitle:
-
-        {subtitle}
-
+        # Use 'gemini-1.5-flash' for high speed and large context window (free tier friendly)
+        # If you specifically want 2.5 and have the new SDK, change this string.
+        model = genai.GenerativeModel("models/gemini-2.5-flash")
+        
+        prompt = f"""
+        Provide a very short summary, no more than three sentences, for the following video transcript.
+        Focus on the main topic and key takeaways.
+        
+        Transcript:
+        {text}
+        
         Summary:
         """
-    summary = generate_newsummary(prompt)
-    return {"summary": summary, "title": title}
+        
+        # Stream=False is standard for short outputs
+        response = model.generate_content(prompt)
+        
+        if response.text:
+            cleaned_text = ' '.join(response.text.split())
+            return cleaned_text
+            
+        return "No summary generated."
+        
+    except Exception as e:
+        print(f"Error in summarize_text: {e}")
+        # Fallback return to prevent code from crashing later
+        return "Summary unavailable due to error."
 
-def summarize_text(text,chunk_size=1024, overlap=100):
-    # Remove this line as it is redundant
-    palm.configure(api_key=api_key)  
-    model = palm.GenerativeModel(model_name="models/gemini-pro")
-    prompt = f"""
-    Provide a very short summary, no more than three sentences, for the following video subtitle:
-    {text}
-    Summary:
+def process_video_from_url(video_url):
     """
-    response = model.generate_content(prompt)
-    summaries=response.text
+    Fetches video info using pytude_d and generates a summary using local summarize_text.
+    """
+    try:
+        # Initialize the video_info class with the URL
+        info = video_info(video_url)
+        
+        # Access the attributes directly
+        title = info.title
+        transcript = info.transcript
+        
+        if not transcript:
+            print(f"No transcript available for {title}.")
+            return None
 
-    normal_string = ''.join(summaries.split())
+        print(f"Transcript found ({len(transcript)} characters). Generating summary...")
 
-    #cleaned_text = final_string.replace("*", "").replace("\n", " ").strip()
+        # LIMIT CHECK: 1.5-Flash can handle ~700,000 words. 
+        # We pass the whole transcript now, removing the previous 10k limit.
+        summary = summarize_text(transcript)
+        
+        return {
+            "summary": summary, 
+            "title": title,
+            "video_id": info.video_id,
+            "thumbnail_url": info.current_thumbnail
+        }
 
-    # Join the summaries of the chunks
-    return ' '.join(normal_string.split())
+    except VideoIdError:
+        print(f"Error: Invalid Video ID extracted from {video_url}")
+        return None
+    except VideoTitleError:
+        print(f"Error: Could not retrieve title for {video_url}")
+        return None
+    except VideoTranscriptError:
+        print(f"Error: Could not retrieve transcript for {video_url}")
+        return None
+    except Exception as e:
+        print(f"An unexpected error occurred processing video: {e}")
+        return None
 
-def Generate_promt(summary,human,text):
-    prompt = f"""Please extract the following information from the video summary:\
-    Video Topic: What is the main subject or theme of the video?\
-    Target Audience: Who is the intended viewer of this video?\
-    Thumbnail Style: Describe the desired visual style for the thumbnail image, including color scheme, composition, and overall aesthetic. {summary}"""
-
-    if human:
-        human="Include human or human face in thumbnial"
-    else :
-        human="Without any humanoid or anthropomorphic features"
+def Generate_promt(summary, include_human, include_text):
+    """
+    Constructs the prompt for the image generator.
+    """
+    # 1. Analyze the summary to get context using the SAME local summary function
+    # (Reusing summarize_text logic but with a different prompt)
     
-    if not text:
-        text="Do not include terms like signs, labels, or banners unless unavoidable and Focus on describing the aesthetics and clarity of the image"
-    else:
-        text="Include title or any Caching Phrases from summary"
-    output_model=generate_newsummary(prompt)
-    style=f"""Give only one best style for an image using the following points and use simple sentences and avoid spelling mistakes:
- 
-           {human} 
-           {text}
-           {output_model}
-
-            Style:
+    try:
+        model = genai.GenerativeModel("models/gemini-2.5-flash")
+        
+        analysis_prompt = f"""
+        Please extract the following information from this video summary to help design a YouTube thumbnail:
+        Video Summary: {summary}
+        
+        Task:
+        1. Video Topic: What is the main subject?
+        2. Target Audience: Who is watching?
+        3. Visual Vibe: Describe the color scheme and aesthetic.
         """
-    text=generate_newsummary(style)
+        
+        response = model.generate_content(analysis_prompt)
+        analysis_output = response.text if response.text else "General topic analysis."
 
-   
-    return text
+        # 2. Set constraints
+        human_constraint = "Include a photorealistic human or human face expressing emotion relevant to the topic." if include_human else "Do NOT include any human faces, people, or humanoid figures."
+        text_constraint = "Include the video title or catchy keywords in big bold letters." if include_text else "Do NOT include any text, letters, or words in the image. Focus purely on the visual art."
 
-def genrate_thumbnail(text,human,text1):
-    prompt=Generate_promt(text,human,text1)
-    print(prompt)
-    return generate_image(prompt)
+        # 3. Create the final style prompt
+        final_prompt_request = f"""
+        Create a detailed image generation prompt for a YouTube thumbnail based on this analysis:
+        {analysis_output}
+
+        Constraints:
+        - {human_constraint}
+        - {text_constraint}
+        - High quality, 4k, trending on artstation.
+
+        Output ONLY the prompt string.
+        """
+        
+        final_response = model.generate_content(final_prompt_request)
+        final_prompt = final_response.text if final_response.text else "A high quality youtube thumbnail."
+        
+        return ' '.join(final_prompt.split())
+
+    except Exception as e:
+        print(f"Error generating prompt: {e}")
+        return "A high quality abstract youtube thumbnail."
+
+def generate_thumbnail_flow(summary, include_human, include_text):
+    """
+    Orchestrates the prompt generation and image creation.
+    """
+    image_prompt = Generate_promt(summary, include_human, include_text)
+    print(f"\nGenerated Image Prompt: {image_prompt}\n")
+    
+    # Call your external image generation function
+    return generate_image(image_prompt)
 
 if __name__ == '__main__':
-   summary="This video explains the nuances of declaring pointers in C/C++.  Specifically, it covers how declaring multiple pointers on one line requires an asterisk before each pointer name, not just one at the beginning.  It also clarifies that when declaring a pointer to an array, the array brackets bind more tightly to the pointer type than the array size, meaning `char *str[20]` declares an array of pointers, not a pointer to an array."
-   #text=genrate_thumbnail(summary,True,False)
-   text=process_video_from_url("https://www.youtube.com/watch?v=LmpAntNjPj0")
-   print(text)
+    # Test Video URL
+    video_url = "https://youtu.be/IMslBEcYXhk?si=ZCfbJnddDIx3AglV"
+
+    print(f"--- Processing {video_url} ---")
+    
+    # 1. Get Video Data & Summary
+    video_data = process_video_from_url(video_url)
+
+    if video_data:
+        print(f"Title: {video_data['title']}")
+        print(f"Video ID: {video_data['video_id']}")
+        print(f"Original Thumb: {video_data['thumbnail_url']}")
+        print(f"Summary: {video_data['summary']}")
+        
+        # 2. Generate a new AI Thumbnail
+        print("\n--- Generating AI Thumbnail ---")
+        try:
+            # Adjust these booleans as needed
+            generated_image_url = generate_thumbnail_flow(
+                video_data['summary'], 
+                include_human=False, 
+                include_text=False
+            )
+            print(f"Generated Image URL: {generated_image_url}")
+        except Exception as e:
+            print(f"Image generation failed: {e}")
+    else:
+        print("Failed to process video.")

@@ -1,5 +1,6 @@
-# Use the slimmer Python 3.9 image
-FROM python:3.9-slim
+FROM python:3.11-slim AS build
+
+# ... rest of your Dockerfile instructions ...
 
 # Set working directory
 WORKDIR /app
