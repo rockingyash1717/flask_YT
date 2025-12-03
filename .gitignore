@@ -10,7 +10,7 @@ venv/
 uploads/
 downloads/
 Downloads/
-.env
+env
 
 # Application files
 app/
